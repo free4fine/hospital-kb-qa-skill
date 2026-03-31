@@ -22,6 +22,13 @@
 - Python 3.10+
 - 项目级虚拟环境 `.venv`
 
+## 安装（git clone）
+
+```bash
+git clone <你的仓库地址>
+cd 标准知识库
+```
+
 安装依赖：
 
 ```bash
