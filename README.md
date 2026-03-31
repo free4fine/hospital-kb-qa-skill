@@ -25,13 +25,8 @@
 ## 安装（git clone）
 
 ```bash
-git clone <你的仓库地址>
-cd 标准知识库
-```
-
-安装依赖：
-
-```bash
+git clone https://github.com/free4fine/hospital-kb-qa-skill.git
+cd hospital-kb-qa-skill
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
