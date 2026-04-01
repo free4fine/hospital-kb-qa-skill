@@ -631,7 +631,12 @@ def has_process_evidence(evidence: list[dict]) -> bool:
     )
 
 
-def query_kb(kb_path: Path, question: str, top_k: int, lexicon_path: Path | None = None) -> dict:
+def query_kb(
+    kb_path: Path,
+    question: str,
+    top_k: int,
+    lexicon_path: Path | None = None,
+) -> dict:
     """执行完整检索链路，返回可回答性判断与证据。"""
     question = normalize_space(question)
     lexicon = load_term_lexicon(lexicon_path)
