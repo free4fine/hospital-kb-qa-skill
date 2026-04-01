@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""本地知识库索引构建脚本。
+
+能力：
+1. 扫描输入目录中的 DOCX/JSONL；
+2. 将 DOCX 转为 JSONL；
+3. 写入 SQLite（原文记录 + FTS + n-gram 索引）。
+"""
+
 import argparse
 import hashlib
 import json
@@ -20,13 +28,15 @@ EXCLUDED_DIRS = {".git", ".venv", "__pycache__"}
 
 @dataclass
 class PreparedDoc:
+    """待入库文档的标准化描述。"""
     source_file: str
-    source_kind: str  # docx|jsonl
+    source_kind: str  # 来源类型：docx|jsonl
     jsonl_path: Path
     doc_id: str
 
 
 def normalize_space(text: str) -> str:
+    """统一空白字符，减少不同来源文本的格式噪声。"""
     text = text.replace("\u3000", " ").replace("\xa0", " ")
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
@@ -34,12 +44,14 @@ def normalize_space(text: str) -> str:
 
 
 def norm_for_gram(text: str) -> str:
+    """为 n-gram 建模准备文本：小写化并仅保留中英文与数字。"""
     text = normalize_space(text).lower()
     text = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
     return text
 
 
 def char_ngrams(text: str, ns: tuple[int, ...] = (2, 3)) -> Counter[str]:
+    """按字符生成 n-gram 词频，用于构建模糊召回索引。"""
     cleaned = norm_for_gram(text)
     grams: Counter[str] = Counter()
     for n in ns:
@@ -51,11 +63,13 @@ def char_ngrams(text: str, ns: tuple[int, ...] = (2, 3)) -> Counter[str]:
 
 
 def stable_doc_id(source_file: str) -> str:
+    """根据逻辑路径生成稳定 doc_id，保证重复导入可去重。"""
     logical_id = str(Path(source_file).with_suffix("")).replace("\\", "/")
     return hashlib.sha1(logical_id.encode("utf-8")).hexdigest()
 
 
 def safe_jsonl_name(source_file: str) -> str:
+    """生成可落盘且基本可读的 JSONL 文件名。"""
     p = Path(source_file)
     stem = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", p.stem)
     digest = hashlib.sha1(source_file.encode("utf-8")).hexdigest()[:10]
@@ -63,6 +77,7 @@ def safe_jsonl_name(source_file: str) -> str:
 
 
 def iter_files(root: Path, suffixes: set[str], kb_root: Path) -> Iterable[Path]:
+    """遍历输入目录并过滤不应入库的文件。"""
     for path in root.rglob("*"):
         if not path.is_file():
             continue
@@ -76,6 +91,7 @@ def iter_files(root: Path, suffixes: set[str], kb_root: Path) -> Iterable[Path]:
 
 
 def validate_jsonl(path: Path) -> None:
+    """校验 JSONL 基本合法性：每行需是 JSON 对象。"""
     with path.open("r", encoding="utf-8") as f:
         for idx, line in enumerate(f, 1):
             raw = line.strip()
@@ -87,12 +103,14 @@ def validate_jsonl(path: Path) -> None:
 
 
 def build_content(record: dict) -> str:
+    """将结构化记录统一转换为可检索文本 content。"""
     rtype = str(record.get("type", "")).strip()
 
     if rtype in {"title", "paragraph", "list_item"}:
         return normalize_space(str(record.get("content", "")))
 
     if rtype == "table_row":
+        # 表格行转成“列名: 值”串联文本，便于关键词检索与追溯。
         pieces: list[str] = []
         for k, v in record.items():
             if k in {"type", "table_index", "row_index"}:
@@ -119,6 +137,7 @@ def build_content(record: dict) -> str:
 
 
 def parse_int_or_none(v) -> int | None:
+    """将值安全转换为整数；失败时返回 None。"""
     if v is None:
         return None
     try:
@@ -128,6 +147,7 @@ def parse_int_or_none(v) -> int | None:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    """初始化数据库结构（重建模式）。"""
     cur = conn.cursor()
     cur.executescript(
         """
@@ -180,6 +200,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def ingest_prepared_docs(conn: sqlite3.Connection, docs: list[PreparedDoc]) -> dict:
+    """把准备好的 JSONL 文档批量写入 SQLite 索引。"""
     cur = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -231,6 +252,7 @@ def ingest_prepared_docs(conn: sqlite3.Connection, docs: list[PreparedDoc]) -> d
                     (rid, content),
                 )
 
+                # 同步写入 n-gram 倒排表，用于后续模糊匹配召回。
                 grams = char_ngrams(content)
                 if grams:
                     cur.executemany(
@@ -261,6 +283,7 @@ def ingest_prepared_docs(conn: sqlite3.Connection, docs: list[PreparedDoc]) -> d
 
 
 def prepare_inputs(args) -> list[PreparedDoc]:
+    """收集输入文件并统一产出可入库的 PreparedDoc 列表。"""
     input_root = args.input_root.resolve()
     kb_root = args.kb_root.resolve()
     kb_jsonl_dir = kb_root / "jsonl"
@@ -268,6 +291,7 @@ def prepare_inputs(args) -> list[PreparedDoc]:
 
     include_docx = args.include_docx
     include_jsonl = args.include_jsonl
+    # 未显式指定时，默认两类都收集。
     if not include_docx and not include_jsonl:
         include_docx = True
         include_jsonl = True
@@ -278,6 +302,7 @@ def prepare_inputs(args) -> list[PreparedDoc]:
         for docx_path in iter_files(input_root, {".docx"}, kb_root):
             source_file = str(docx_path.relative_to(input_root)).replace("\\", "/")
             out_jsonl = kb_jsonl_dir / safe_jsonl_name(source_file)
+            # 先把 DOCX 结构化为 JSONL，再统一走入库逻辑。
             convert_docx_to_jsonl(docx_path, out_jsonl)
             prepared.append(
                 PreparedDoc(
@@ -294,6 +319,7 @@ def prepare_inputs(args) -> list[PreparedDoc]:
             validate_jsonl(jsonl_path)
 
             out_jsonl = kb_jsonl_dir / safe_jsonl_name(source_file)
+            # 复制到 kb/jsonl，确保索引输入稳定、可复现。
             shutil.copyfile(jsonl_path, out_jsonl)
             prepared.append(
                 PreparedDoc(
@@ -304,7 +330,7 @@ def prepare_inputs(args) -> list[PreparedDoc]:
                 )
             )
 
-    # De-duplicate by doc_id (last one wins; prefer explicit jsonl if both exist).
+    # 基于 doc_id 去重：若同文档同时存在 docx 与 jsonl，优先保留显式 jsonl。
     dedup: dict[str, PreparedDoc] = {}
     for doc in prepared:
         if doc.doc_id in dedup and dedup[doc.doc_id].source_kind == "docx" and doc.source_kind == "jsonl":
@@ -316,6 +342,7 @@ def prepare_inputs(args) -> list[PreparedDoc]:
 
 
 def main() -> None:
+    """命令行入口。"""
     parser = argparse.ArgumentParser(description="Build local KB index from docx/jsonl files.")
     parser.add_argument("--kb-root", type=Path, default=Path("./kb"), help="KB output root, default ./kb")
     parser.add_argument("--input-root", type=Path, default=Path("."), help="Input root directory")

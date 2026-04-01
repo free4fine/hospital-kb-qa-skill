@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""根据标准 JSONL 生成“智慧服务 2 级”自评打分表（XLSX）。"""
+
 import argparse
 import json
 import re
@@ -29,6 +31,7 @@ WARN_FILL = PatternFill("solid", fgColor="FCE4D6")
 
 
 def load_level2_basic_items(jsonl_path: Path) -> list[dict]:
+    """从 JSONL 提取 2 级且“基本项=是”的去重条款。"""
     items = []
     seen = set()
 
@@ -68,6 +71,7 @@ def load_level2_basic_items(jsonl_path: Path) -> list[dict]:
 
 
 def apply_table_style(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> None:
+    """统一设置表格边框、表头样式和单元格对齐。"""
     for r in range(min_row, max_row + 1):
         for c in range(min_col, max_col + 1):
             cell = ws.cell(r, c)
@@ -81,9 +85,10 @@ def apply_table_style(ws, min_row: int, max_row: int, min_col: int, max_col: int
 
 
 def build_workbook(items: list[dict], output_path: Path) -> None:
+    """构建并保存三张工作表：总览、清单、填报说明。"""
     wb = Workbook()
 
-    # Sheet 1: Overview
+    # Sheet 1：申报总览与关键门槛判断。
     ws = wb.active
     ws.title = "2级申报总览"
 
@@ -117,6 +122,7 @@ def build_workbook(items: list[dict], output_path: Path) -> None:
     ws["A15"] = "基本项目是否全部达标"
     ws["B15"] = "=IF(COUNTIFS('2级基本项清单'!F:F,\"<>\",'2级基本项清单'!F:F,\"<>符合\")=0,\"是\",\"否\")"
     ws["A16"] = "申报建议"
+    # 申报建议规则：总分、选择项目、基本项三条件同时满足。
     ws["B16"] = "=IF(AND(B10>=20,B11>=6,B15=\"是\"),\"可申报2级（建议复核）\",\"暂不满足2级申报\")"
 
     project_counter = OrderedDict()
@@ -149,7 +155,7 @@ def build_workbook(items: list[dict], output_path: Path) -> None:
     ws.column_dimensions["C"].width = 16
     ws.column_dimensions["D"].width = 16
 
-    # Sheet 2: checklist
+    # Sheet 2：逐条检查清单（现场状态 + 证据 + 问题整改）。
     ws2 = wb.create_sheet("2级基本项清单")
     headers = [
         "序号",
@@ -179,6 +185,7 @@ def build_workbook(items: list[dict], output_path: Path) -> None:
                 item["条款编号"],
                 item["条款内容"],
                 "待确认",
+                # 状态为“符合”时自动记 1 分，其余状态记 0 分。
                 f"=IF(F{i+1}=\"符合\",1,0)",
                 "",
                 "",
@@ -212,6 +219,7 @@ def build_workbook(items: list[dict], output_path: Path) -> None:
     ws2.add_data_validation(dv)
     dv.add(f"F2:F{max(2, len(items)+1)}")
 
+    # 对“符合/不符合”做颜色提示，便于现场快速浏览。
     ws2.conditional_formatting.add(
         f"F2:F{max(2, len(items)+1)}",
         CellIsRule(operator="equal", formula=['"符合"'], fill=GOOD_FILL),
@@ -221,7 +229,7 @@ def build_workbook(items: list[dict], output_path: Path) -> None:
         CellIsRule(operator="equal", formula=['"不符合"'], fill=WARN_FILL),
     )
 
-    # Sheet 3: instructions
+    # Sheet 3：填报口径与字段说明。
     ws3 = wb.create_sheet("填报说明")
     notes = [
         "使用说明",
@@ -246,6 +254,7 @@ def build_workbook(items: list[dict], output_path: Path) -> None:
 
 
 def main() -> None:
+    """命令行入口。"""
     parser = argparse.ArgumentParser(description="Build Level-2 self-assessment scoring workbook from JSONL.")
     parser.add_argument("--jsonl", type=Path, required=True, help="Input JSONL path")
     parser.add_argument("--output", type=Path, default=Path("医院智慧服务2级申报自评打分表.xlsx"), help="Output XLSX path")

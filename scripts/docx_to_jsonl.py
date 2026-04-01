@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""将医院标准类 DOCX 文档转换为结构化 JSONL。
+
+输出记录包含：
+- title / paragraph / list_item
+- table_row（携带 table_index、row_index 与列字段）
+"""
+
 import argparse
 import json
 import re
@@ -16,6 +23,7 @@ from docx.text.paragraph import Paragraph
 
 
 def clean_text(text: str) -> str:
+    """统一空白字符，减少版式差异对后续解析的影响。"""
     text = text.replace("\u3000", " ").replace("\xa0", " ")
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
@@ -23,6 +31,7 @@ def clean_text(text: str) -> str:
 
 
 def iter_block_items(parent):
+    """按文档中的实际顺序迭代段落与表格。"""
     if isinstance(parent, _Document):
         parent_elm = parent.element.body
     else:
@@ -35,6 +44,7 @@ def iter_block_items(parent):
 
 
 def heading_level(style_name: str) -> int | None:
+    """从段落样式名中提取标题层级（兼容英文 Heading/中文标题）。"""
     if not style_name:
         return None
     if style_name.lower().startswith("heading"):
@@ -47,11 +57,13 @@ def heading_level(style_name: str) -> int | None:
 
 
 def is_list_paragraph(paragraph: Paragraph) -> bool:
+    """通过 Word 编号属性判断是否为列表段落。"""
     p_pr = paragraph._p.pPr
     return bool(p_pr is not None and p_pr.numPr is not None)
 
 
 def infer_title_level_from_text(text: str) -> int | None:
+    """当样式不可用时，基于常见中文标题编号模式推断层级。"""
     if re.match(r"^[一二三四五六七八九十]+、", text) and len(text) <= 30:
         return 1
     if re.match(r"^[（(][一二三四五六七八九十]+[)）]", text) and len(text) <= 24:
@@ -62,6 +74,7 @@ def infer_title_level_from_text(text: str) -> int | None:
 
 
 def is_list_text(text: str) -> bool:
+    """基于文本前缀判断是否是列表项（如（一）、1.、-）。"""
     return bool(
         re.match(r"^[（(][一二三四五六七八九十]+[)）]", text)
         or re.match(r"^[（(]?\d+[)）\.、]", text)
@@ -70,6 +83,7 @@ def is_list_text(text: str) -> bool:
 
 
 def unique_headers(headers: list[str]) -> list[str]:
+    """清洗并去重表头，保证生成的 JSON 字段名唯一。"""
     counter: Counter[str] = Counter()
     out: list[str] = []
     for i, h in enumerate(headers, 1):
@@ -83,6 +97,7 @@ def unique_headers(headers: list[str]) -> list[str]:
 
 
 def looks_like_header_row(row: list[str]) -> bool:
+    """用关键词启发式判断首行是否为表头。"""
     keywords = [
         "序号",
         "类别",
@@ -106,6 +121,7 @@ def looks_like_header_row(row: list[str]) -> bool:
 
 
 def tc_text(tc) -> str:
+    """提取单元格文本（拼接所有 w:t 节点）。"""
     parts = []
     for t in tc.xpath(".//w:t"):
         if t.text:
@@ -114,11 +130,12 @@ def tc_text(tc) -> str:
 
 
 def expand_table(table: Table) -> list[list[str]]:
+    """展开 Word 表格为二维矩阵，并处理横向/纵向合并单元格。"""
     tr_list = list(table._tbl.tr_lst)
     if not tr_list:
         return []
 
-    # Use table grid width when available.
+    # 优先使用表格网格定义的列数；缺失时再从每行 gridSpan 推断。
     max_cols = len(table.columns) if table.columns else 0
     if max_cols == 0:
         for tr in tr_list:
@@ -163,7 +180,7 @@ def expand_table(table: Table) -> list[list[str]]:
 
             col += span
 
-        # Fill unresolved columns from previous row only when they are part of vertical merge omissions.
+        # 未填充列通常来自纵向合并造成的省略，沿用上一行同列值。
         for c in range(max_cols):
             if row[c] is None:
                 row[c] = prev_row[c] if prev_row[c] else ""
@@ -171,7 +188,7 @@ def expand_table(table: Table) -> list[list[str]]:
         matrix.append([clean_text(v) for v in row])
         prev_row = matrix[-1]
 
-    # Final downward fill for any remaining same-column blanks.
+    # 最后再做一次向下填充，兜底清理残余空白。
     for r in range(1, len(matrix)):
         for c in range(max_cols):
             if not matrix[r][c] and matrix[r - 1][c]:
@@ -181,9 +198,11 @@ def expand_table(table: Table) -> list[list[str]]:
 
 
 def convert(input_path: Path, output_path: Path) -> None:
+    """执行 DOCX -> JSONL 转换主流程。"""
     doc = Document(str(input_path))
     records: list[dict] = []
     table_index = 0
+    # 按列数缓存最近表头，处理跨页/续表场景下“无表头数据块”。
     schema_by_cols: dict[int, list[str]] = {}
 
     first_text_seen = False
@@ -194,6 +213,7 @@ def convert(input_path: Path, output_path: Path) -> None:
                 continue
 
             if not first_text_seen:
+                # 首个正文块通常是文档标题，统一标记为一级标题。
                 records.append({"type": "title", "level": 1, "content": text})
                 first_text_seen = True
                 continue
@@ -239,6 +259,7 @@ def convert(input_path: Path, output_path: Path) -> None:
 
 
 def main() -> None:
+    """命令行入口。"""
     parser = argparse.ArgumentParser(description="Convert DOCX to JSONL (title/paragraph/list/table_row).")
     parser.add_argument("input", type=Path, help="Input .docx path")
     parser.add_argument("-o", "--output", type=Path, help="Output .jsonl path")

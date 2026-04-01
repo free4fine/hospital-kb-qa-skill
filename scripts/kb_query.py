@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""本地知识库检索与问答草稿生成脚本。
+
+流程概览：
+1. 对用户问题做清洗与分词；
+2. 分别用 FTS 关键词召回和字符 n-gram 召回；
+3. 融合打分并筛选证据；
+4. 生成带引用位置的回答草稿。
+"""
+
 import argparse
 import json
 import re
@@ -10,6 +19,7 @@ from pathlib import Path
 
 
 def normalize_space(text: str) -> str:
+    """统一空白字符，避免换行/全角空格影响检索。"""
     text = text.replace("\u3000", " ").replace("\xa0", " ")
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
@@ -17,11 +27,13 @@ def normalize_space(text: str) -> str:
 
 
 def norm_for_gram(text: str) -> str:
+    """为 n-gram 建模准备文本：小写化并仅保留中英文与数字。"""
     text = normalize_space(text).lower()
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
 
 
 def char_ngrams(text: str, ns: tuple[int, ...] = (2, 3)) -> Counter[str]:
+    """按字符生成 n-gram 词频，用于模糊匹配打分。"""
     cleaned = norm_for_gram(text)
     grams: Counter[str] = Counter()
     for n in ns:
@@ -33,7 +45,7 @@ def char_ngrams(text: str, ns: tuple[int, ...] = (2, 3)) -> Counter[str]:
 
 
 def extract_terms(question: str) -> list[str]:
-    # Chinese chunks + Latin words + numbers
+    """抽取检索关键词（中文短语、英文词、数字），并做去重。"""
     terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9_]+", question)
     uniq: list[str] = []
     seen = set()
@@ -49,6 +61,7 @@ def extract_terms(question: str) -> list[str]:
 
 
 def core_question_phrases(question: str) -> list[str]:
+    """提取问题核心短语，用于后续“短语精确命中”判断。"""
     q = normalize_space(question)
     for marker in [
         "的要求是什么",
@@ -76,12 +89,19 @@ def core_question_phrases(question: str) -> list[str]:
 
 
 def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[dict[int, float], dict[int, sqlite3.Row]]:
+    """基于 FTS 召回候选记录，并输出 record_id -> score 映射。
+
+    返回两个结构：
+    - scores: record_id 到分数的映射
+    - rows_map: record_id 到原始行数据的映射（避免后续重复查库）
+    """
     cur = conn.cursor()
     terms = extract_terms(question)
     scores: dict[int, float] = {}
     rows_map: dict[int, sqlite3.Row] = {}
 
     if terms:
+        # 限制关键词数量，避免 FTS 查询表达式过长。
         fts_query = " OR ".join(f'"{t.replace(chr(34), " ")}"' for t in terms[:10])
     else:
         fts_query = question.replace('"', " ").strip()
@@ -110,6 +130,7 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
             for row in rows:
                 rid = int(row["record_id"])
                 rank = float(row["rank"]) if row["rank"] is not None else 1000.0
+                # 某些 SQLite FTS/BM25 配置会返回负值，这里统一为正值参与转换。
                 if rank < 0:
                     rank = abs(rank)
                 score = 1.0 / (1.0 + rank)
@@ -117,9 +138,10 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
                     scores[rid] = score
                     rows_map[rid] = row
         except sqlite3.OperationalError:
+            # FTS 表不存在或查询异常时，降级走 LIKE 召回，不中断流程。
             pass
 
-    # LIKE fallback for Chinese/symbol-heavy questions.
+    # 对中文或符号较多的问题，LIKE 往往更稳，作为兜底召回。
     like_terms = terms[:8] if terms else [question.strip()]
     like_terms = [t for t in like_terms if t]
     if like_terms:
@@ -149,6 +171,7 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
 
 
 def ngram_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> dict[int, float]:
+    """基于字符 n-gram 的重叠度召回，补足关键词检索的漏召回。"""
     q_grams = char_ngrams(question)
     if not q_grams:
         return {}
@@ -160,6 +183,7 @@ def ngram_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> dict[
     cur = conn.cursor()
     record_overlap: dict[int, float] = defaultdict(float)
 
+    # 分批查询，避免 IN 子句过长。
     batch_size = 300
     for i in range(0, len(grams), batch_size):
         batch = grams[i : i + batch_size]
@@ -183,6 +207,7 @@ def ngram_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> dict[
 
 
 def fetch_rows_by_ids(conn: sqlite3.Connection, ids: list[int]) -> dict[int, sqlite3.Row]:
+    """按 record_id 批量回表读取详情。"""
     if not ids:
         return {}
     cur = conn.cursor()
@@ -209,6 +234,7 @@ def combine_scores(
     kw_scores: dict[int, float],
     ng_scores: dict[int, float],
 ) -> dict[int, float]:
+    """融合两路召回分数并给予双命中轻微加分。"""
     combined: dict[int, float] = {}
     all_ids = set(kw_scores) | set(ng_scores)
     for rid in all_ids:
@@ -222,6 +248,7 @@ def combine_scores(
 
 
 def make_draft_answer(question: str, evidence: list[dict], answerable: bool, gaps: list[str]) -> str:
+    """将证据片段整理为可读的回答草稿。"""
     if not evidence:
         return "结论：证据不足，无法给出确定结论。\n依据（跨文档）：未检索到有效证据。"
 
@@ -273,6 +300,7 @@ def make_draft_answer(question: str, evidence: list[dict], answerable: bool, gap
 
 
 def query_kb(kb_path: Path, question: str, top_k: int) -> dict:
+    """执行完整检索链路，返回可回答性判断与证据。"""
     question = normalize_space(question)
     if not question:
         return {
@@ -312,6 +340,7 @@ def query_kb(kb_path: Path, question: str, top_k: int) -> dict:
 
         evidence: list[dict] = []
         top_combined_score = float(combined.get(ranked_ids[0], 0.0))
+        # 仅保留相对高分片段：绝对下限 + 相对 top 分数阈值。
         min_keep_score = max(0.08, top_combined_score * 0.35)
         for rid in ranked_ids:
             row = rows_cache.get(rid)
@@ -344,6 +373,7 @@ def query_kb(kb_path: Path, question: str, top_k: int) -> dict:
         top_score = evidence[0]["score"]
         strong_count = sum(1 for ev in evidence if ev["score"] >= 0.30)
         core_phrases = core_question_phrases(question)
+        # 规则化可回答判断：高分即通过，中分需多证据，低分需核心短语强命中。
         has_exact_phrase_hit = any(
             any(phrase in ev["content"] for phrase in core_phrases) for ev in evidence[:3]
         )
@@ -369,6 +399,7 @@ def query_kb(kb_path: Path, question: str, top_k: int) -> dict:
 
 
 def main() -> None:
+    """命令行入口。"""
     parser = argparse.ArgumentParser(description="Query local KB sqlite and return evidence-grounded answer draft.")
     parser.add_argument("--kb", type=Path, required=True, help="Path to kb sqlite, e.g. ./kb/kb.sqlite")
     parser.add_argument("--question", required=True, help="User question")
