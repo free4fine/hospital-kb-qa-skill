@@ -20,6 +20,19 @@ from typing import Any
 
 
 SOURCE_POLICY = "local_kb_only"
+CHECKLIST_KEYWORDS = [
+    "清单",
+    "完整",
+    "全部",
+    "全量",
+    "逐条",
+    "逐项",
+    "明细",
+    "不概括",
+    "原文",
+    "核查表",
+    "打分表",
+]
 DEFAULT_TERM_LEXICON = {
     "canonical_terms": [
         {
