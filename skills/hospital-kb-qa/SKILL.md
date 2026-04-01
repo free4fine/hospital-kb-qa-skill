@@ -36,10 +36,14 @@ description: |
 
 返回字段：
 
+- `status`：`clarification_required | answered | no_evidence`。
 - `answerable`：是否达到可回答阈值。
 - `evidence[]`：证据片段，含 `source_file/table_index/row_index/content/score`。
 - `draft_answer`：按模板组织的回答草稿。
 - `gaps[]`：证据不足或不确定点。
+- `clarification_question`：需要澄清时的问题文本。
+- `suggested_terms`：候选标准术语列表。
+- `source_policy`：固定 `local_kb_only`。
 
 ## Answer Policy
 
@@ -52,17 +56,19 @@ description: |
 
 强约束：
 
+- 只允许使用本地 `kb.sqlite` 与本地文档，不得联网检索、不得引用外部常识补全。
 - 仅基于 `evidence` 输出结论。
+- 术语不确定时必须先澄清，且每次只问一个澄清问题。
 - `answerable=false` 时必须明确“证据不足，无法给出确定结论”。
+- `status=no_evidence` 时禁止补充申报流程、实施路径等知识库外内容。
 - 不输出无证据支撑的推断。
 
 ## Proactive Next-Step Trigger
 
-当回答“条款/要求/清单”类问题后，若满足以下条件，应主动给出一句可执行的下一步建议（如 Excel/JSON 核查表）：
+当回答“条款/要求/清单”类问题后，且用户明确提出“要模板/表格/执行产物”时，才给出下一步建议（如 Excel/JSON 核查表）：
 
-1. 用户目标已从“查询信息”自然过渡到“落地执行”（如申报、自评、整改、检查）。
-2. 当前回答可结构化为表格字段（条款、状态、证据、责任人、期限、得分等）。
-3. 已有知识库证据可直接映射到模板，不需要额外外部数据。
+1. 当前回答可结构化为表格字段（条款、状态、证据、责任人、期限、得分等）。
+2. 已有知识库证据可直接映射到模板，不需要额外外部数据。
 
 建议输出模板（单句）：
 
@@ -72,4 +78,5 @@ description: |
 
 - 首版接入范围：`docx + jsonl`（`.doc` 暂不自动转换）。
 - 如果源文档更新，先重新执行 `ingest` 再 `query`。
+- 术语词表文件：`skills/hospital-kb-qa/references/term_lexicon.json`。
 - 依赖项目级虚拟环境 `.venv`。
