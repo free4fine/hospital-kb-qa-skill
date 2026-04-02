@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sqlite3
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -362,6 +364,7 @@ def build_clarification_result(
         "clarification_question": clarification_question,
         "suggested_terms": suggestions,
         "source_policy": SOURCE_POLICY,
+        "fallback_used": False,
     }
 
 
@@ -468,6 +471,151 @@ def source_matches_patterns(source_file: str, patterns: list[str]) -> bool:
     if not patterns:
         return False
     return any(p in source_file for p in patterns)
+
+
+def resolve_jsonl_root(kb_path: Path, jsonl_root: Path | None = None) -> Path:
+    """推断 JSONL 目录路径：默认与 kb.sqlite 同级的 jsonl 子目录。"""
+    if jsonl_root is not None:
+        return jsonl_root
+    return kb_path.parent / "jsonl"
+
+
+def scoped_jsonl_files(jsonl_root: Path, source_patterns: list[str]) -> list[Path]:
+    """按 source_file 模式筛选 JSONL 文件列表。"""
+    if not jsonl_root.exists() or not jsonl_root.is_dir():
+        return []
+
+    files = sorted(p for p in jsonl_root.glob("*.jsonl") if p.is_file())
+    if not source_patterns:
+        return files
+
+    out: list[Path] = []
+    for p in files:
+        name = p.name
+        if any(pattern in name for pattern in source_patterns):
+            out.append(p)
+    return out
+
+
+def record_to_content(record: dict[str, Any]) -> str:
+    """从 JSONL 记录中提取可检索文本，优先使用标准 content 字段。"""
+    content = normalize_space(str(record.get("content", "")))
+    if content:
+        return content
+
+    # 兜底：table_row 可能以字段列展开，拼回“字段: 值”文本。
+    if str(record.get("type", "")).strip() == "table_row":
+        parts: list[str] = []
+        for k, v in record.items():
+            if k in {"type", "table_index", "row_index", "record_id", "doc_id", "source_file", "raw_json"}:
+                continue
+            if v is None:
+                continue
+            val = normalize_space(str(v))
+            if not val:
+                continue
+            parts.append(f"{k}: {val}")
+        return "；".join(parts)
+    return ""
+
+
+def rg_fallback_retrieve(
+    question: str,
+    kb_path: Path,
+    top_k: int,
+    source_patterns: list[str],
+    lexicon: dict[str, Any],
+    jsonl_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """sqlite 未命中时，使用本地 rg 扫描 JSONL 作为补检通道。"""
+    rg_bin = shutil.which("rg")
+    if rg_bin is None:
+        return []
+
+    root = resolve_jsonl_root(kb_path, jsonl_root)
+    files = scoped_jsonl_files(root, source_patterns)
+    if not files:
+        return []
+
+    retrieval_q = augment_question_for_retrieval(question, lexicon)
+    terms = extract_terms(retrieval_q)
+    stop_terms = {"要求", "需要", "什么", "哪些", "请问", "有何", "怎么", "如何", "以及"}
+    terms = [t for t in terms if t not in stop_terms]
+    if not terms:
+        return []
+
+    pattern_terms = terms[:10]
+    regex = "|".join(re.escape(t) for t in pattern_terms)
+    cmd = [rg_bin, "-n", "--with-filename", "--no-heading", "--color", "never", "-e", regex, *[str(p) for p in files]]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError:
+        return []
+    if proc.returncode not in (0, 1):
+        return []
+
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    q_level_vars: set[str] = set(level_variants(extract_level_token(question)))
+    core_phrases = core_question_phrases(question)
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any, Any]] = set()
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        file_path, _, raw_jsonl = parts
+        try:
+            record = json.loads(raw_jsonl)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+
+        source_file = str(record.get("source_file") or file_path)
+        if source_patterns and not source_matches_patterns(source_file, source_patterns):
+            continue
+
+        content = record_to_content(record)
+        if not content:
+            continue
+
+        key = (
+            source_file,
+            record.get("table_index"),
+            record.get("row_index"),
+            content,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        hit_count = sum(1 for t in pattern_terms if t in content)
+        score = hit_count / max(1, len(pattern_terms))
+        if q_level_vars and any(v in content for v in q_level_vars):
+            score += 0.15
+        if core_phrases and any(p in content for p in core_phrases[:2]):
+            score += 0.10
+        score = round(min(1.0, max(0.0, score)), 4)
+
+        candidates.append(
+            {
+                "source_file": source_file,
+                "table_index": record.get("table_index"),
+                "row_index": record.get("row_index"),
+                "content": content,
+                "score": score,
+                "retrieval_method": "jq_rg_fallback",
+            }
+        )
+
+    candidates.sort(
+        key=lambda x: (-float(x.get("score", 0.0)), str(x.get("source_file", "")), str(x.get("table_index", "")))
+    )
+    return candidates[:top_k]
 
 
 def fts_retrieve(
@@ -793,31 +941,86 @@ def has_process_evidence(evidence: list[dict]) -> bool:
     )
 
 
+def assess_answerable(question: str, evidence: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+    """按统一规则判断证据是否足以回答。"""
+    if not evidence:
+        return False, ["知识库中未检索到可用证据。"]
+
+    top_score = float(evidence[0].get("score", 0.0))
+    strong_count = sum(1 for ev in evidence if float(ev.get("score", 0.0)) >= 0.30)
+    level_token = extract_level_token(question)
+    lvl_vars = set(level_variants(level_token))
+    core_phrases = core_question_phrases(question)
+
+    has_exact_phrase_hit = any(any(phrase in str(ev.get("content", "")) for phrase in core_phrases) for ev in evidence[:3])
+    has_level_evidence = bool(
+        lvl_vars
+        and any(
+            ("等级要求" in str(ev.get("content", "")) or "等级:" in str(ev.get("content", "")))
+            and any(v in str(ev.get("content", "")) for v in lvl_vars)
+            for ev in evidence[:6]
+        )
+    )
+    answerable = bool(
+        top_score >= 0.48
+        or (top_score >= 0.34 and strong_count >= 2)
+        or (has_exact_phrase_hit and top_score >= 0.18)
+        or (has_level_evidence and top_score >= 0.10)
+    )
+
+    gaps: list[str] = []
+    if needs_process_evidence(question) and not has_process_evidence(evidence):
+        answerable = False
+        gaps.append("问题要求“流程/步骤”，但本地知识库未命中对应流程条款。")
+    if not answerable and not gaps:
+        gaps.append("命中证据与问题关联度不足，无法形成确定结论。")
+    return answerable, gaps
+
+
+def build_query_result(
+    status: str,
+    answerable: bool,
+    evidence: list[dict[str, Any]],
+    draft_answer: str,
+    gaps: list[str],
+    fallback_used: bool,
+    clarification_question: str | None = None,
+    suggested_terms: list[str] | None = None,
+) -> dict[str, Any]:
+    """统一构造查询输出结构，保证字段稳定。"""
+    return {
+        "status": status,
+        "answerable": answerable,
+        "evidence": evidence,
+        "draft_answer": draft_answer,
+        "gaps": gaps,
+        "clarification_question": clarification_question,
+        "suggested_terms": suggested_terms or [],
+        "source_policy": SOURCE_POLICY,
+        "fallback_used": fallback_used,
+    }
+
+
 def query_kb(
     kb_path: Path,
     question: str,
     top_k: int,
     lexicon_path: Path | None = None,
     source_scope_path: Path | None = None,
+    jsonl_root: Path | None = None,
+    enable_jq_rg_fallback: bool = True,
 ) -> dict:
     """执行完整检索链路，返回可回答性判断与证据。"""
     question = normalize_space(question)
     lexicon = load_term_lexicon(lexicon_path)
     source_scope = load_source_scope(source_scope_path)
     if not question:
-        return {
-            "status": "no_evidence",
-            "answerable": False,
-            "evidence": [],
-            "draft_answer": "结论：证据不足，无法给出确定结论。",
-            "gaps": ["问题为空，请提供具体问题。"],
-            "clarification_question": None,
-            "suggested_terms": [],
-            "source_policy": SOURCE_POLICY,
-        }
+        gaps = ["问题为空，请提供具体问题。"]
+        return build_query_result("no_evidence", False, [], make_draft_answer(question, [], False, gaps), gaps, False)
 
     gated = term_gate(question, lexicon)
     if gated is not None:
+        gated.setdefault("fallback_used", False)
         return gated
 
     matched_domains, _ = detect_domains_and_alias_hits(question, lexicon)
@@ -825,16 +1028,44 @@ def query_kb(
     source_patterns, missing_domains = resolve_source_patterns(question, lexicon, source_scope)
     if missing_domains:
         gaps = [f"口径来源白名单未配置：{', '.join(missing_domains)}。"]
-        return {
-            "status": "no_evidence",
-            "answerable": False,
-            "evidence": [],
-            "draft_answer": make_draft_answer(question, [], False, gaps),
-            "gaps": gaps,
-            "clarification_question": None,
-            "suggested_terms": [],
-            "source_policy": SOURCE_POLICY,
-        }
+        return build_query_result("no_evidence", False, [], make_draft_answer(question, [], False, gaps), gaps, False)
+
+    def resolve_no_evidence(base_gaps: list[str]) -> dict[str, Any]:
+        """主通道未命中时，按需触发 jq/rg 补检。"""
+        gaps = list(base_gaps)
+        if enable_jq_rg_fallback:
+            fallback_evidence = rg_fallback_retrieve(
+                question=question,
+                kb_path=kb_path,
+                top_k=top_k,
+                source_patterns=source_patterns,
+                lexicon=lexicon,
+                jsonl_root=jsonl_root,
+            )
+            if fallback_evidence:
+                answerable, fb_gaps = assess_answerable(question, fallback_evidence)
+                merged_gaps = fb_gaps if answerable else list(dict.fromkeys(gaps + fb_gaps))
+                draft_answer = make_draft_answer(question, fallback_evidence, answerable, merged_gaps)
+                status = "answered" if answerable else "no_evidence"
+                return build_query_result(
+                    status=status,
+                    answerable=answerable,
+                    evidence=fallback_evidence,
+                    draft_answer=draft_answer,
+                    gaps=merged_gaps,
+                    fallback_used=True,
+                )
+            gaps.append("sqlite 主检索未命中，jq/rg 补检也未命中。")
+
+        uniq_gaps = list(dict.fromkeys(gaps))
+        return build_query_result(
+            status="no_evidence",
+            answerable=False,
+            evidence=[],
+            draft_answer=make_draft_answer(question, [], False, uniq_gaps),
+            gaps=uniq_gaps,
+            fallback_used=False,
+        )
 
     conn = sqlite3.connect(str(kb_path))
     conn.row_factory = sqlite3.Row
@@ -845,20 +1076,8 @@ def query_kb(
         combined = combine_scores(kw_scores, ng_scores)
 
         if not combined:
-            if source_patterns:
-                gaps = ["指定口径来源范围内未检索到相关片段。"]
-            else:
-                gaps = ["知识库中未检索到相关片段。"]
-            return {
-                "status": "no_evidence",
-                "answerable": False,
-                "evidence": [],
-                "draft_answer": make_draft_answer(question, [], False, gaps),
-                "gaps": gaps,
-                "clarification_question": None,
-                "suggested_terms": [],
-                "source_policy": SOURCE_POLICY,
-            }
+            gaps = ["指定口径来源范围内未检索到相关片段。"] if source_patterns else ["知识库中未检索到相关片段。"]
+            return resolve_no_evidence(gaps)
 
         pre_ranked_ids = sorted(
             combined.keys(),
@@ -900,17 +1119,7 @@ def query_kb(
 
         evidence: list[dict] = []
         if not ranked_ids:
-            gaps = ["知识库中未检索到相关片段。"]
-            return {
-                "status": "no_evidence",
-                "answerable": False,
-                "evidence": [],
-                "draft_answer": make_draft_answer(question, [], False, gaps),
-                "gaps": gaps,
-                "clarification_question": None,
-                "suggested_terms": [],
-                "source_policy": SOURCE_POLICY,
-            }
+            return resolve_no_evidence(["知识库中未检索到相关片段。"])
 
         top_combined_score = float(adjusted_scores.get(ranked_ids[0], 0.0))
         # 仅保留相对高分片段：绝对下限 + 相对 top 分数阈值。
@@ -935,6 +1144,7 @@ def query_kb(
                     "row_index": row["row_index"],
                     "content": content,
                     "score": round(score, 4),
+                    "retrieval_method": "sqlite_main",
                 }
             )
             if len(evidence) >= collect_limit:
@@ -993,6 +1203,7 @@ def query_kb(
                                 "row_index": row["row_index"],
                                 "content": content,
                                 "score": round(score, 4),
+                                "retrieval_method": "sqlite_main",
                             }
                         )
                         missing_domains_in_evidence = [
@@ -1039,61 +1250,12 @@ def query_kb(
                 evidence = picked[:top_k]
 
         if not evidence:
-            gaps = ["知识库中未检索到可用证据。"]
-            return {
-                "status": "no_evidence",
-                "answerable": False,
-                "evidence": [],
-                "draft_answer": make_draft_answer(question, [], False, gaps),
-                "gaps": gaps,
-                "clarification_question": None,
-                "suggested_terms": [],
-                "source_policy": SOURCE_POLICY,
-            }
+            return resolve_no_evidence(["知识库中未检索到可用证据。"])
 
-        top_score = evidence[0]["score"]
-        strong_count = sum(1 for ev in evidence if ev["score"] >= 0.30)
-        level_token = extract_level_token(question)
-        lvl_vars = set(level_variants(level_token))
-        core_phrases = core_question_phrases(question)
-        # 规则化可回答判断：高分即通过，中分需多证据，低分需核心短语强命中。
-        has_exact_phrase_hit = any(
-            any(phrase in ev["content"] for phrase in core_phrases) for ev in evidence[:3]
-        )
-        has_level_evidence = bool(
-            lvl_vars
-            and any(
-                ("等级要求" in ev["content"] or "等级:" in ev["content"])
-                and any(v in ev["content"] for v in lvl_vars)
-                for ev in evidence[:6]
-            )
-        )
-        answerable = bool(
-            top_score >= 0.48
-            or (top_score >= 0.34 and strong_count >= 2)
-            or (has_exact_phrase_hit and top_score >= 0.18)
-            or (has_level_evidence and top_score >= 0.10)
-        )
-
-        gaps: list[str] = []
-        if needs_process_evidence(question) and not has_process_evidence(evidence):
-            answerable = False
-            gaps.append("问题要求“流程/步骤”，但本地知识库未命中对应流程条款。")
-        if not answerable:
-            if not gaps:
-                gaps.append("命中证据与问题关联度不足，无法形成确定结论。")
-
+        answerable, gaps = assess_answerable(question, evidence)
         draft_answer = make_draft_answer(question, evidence, answerable, gaps)
-        return {
-            "status": "answered" if answerable else "no_evidence",
-            "answerable": answerable,
-            "evidence": evidence,
-            "draft_answer": draft_answer,
-            "gaps": gaps,
-            "clarification_question": None,
-            "suggested_terms": [],
-            "source_policy": SOURCE_POLICY,
-        }
+        status = "answered" if answerable else "no_evidence"
+        return build_query_result(status, answerable, evidence, draft_answer, gaps, False)
     finally:
         conn.close()
 
@@ -1116,10 +1278,29 @@ def main() -> None:
         default=Path("./skills/hospital-kb-qa/references/source_scope.json"),
         help="Path to source scope json",
     )
+    parser.add_argument(
+        "--jsonl-root",
+        type=Path,
+        default=Path("./kb/jsonl"),
+        help="Path to JSONL directory for jq/rg fallback retrieval",
+    )
+    parser.add_argument(
+        "--no-jq-rg-fallback",
+        action="store_true",
+        help="Disable jq/rg fallback retrieval when sqlite returns no evidence",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     args = parser.parse_args()
 
-    result = query_kb(args.kb, args.question, args.top_k, args.term_lexicon, args.source_scope)
+    result = query_kb(
+        args.kb,
+        args.question,
+        args.top_k,
+        args.term_lexicon,
+        args.source_scope,
+        args.jsonl_root,
+        not args.no_jq_rg_fallback,
+    )
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False))

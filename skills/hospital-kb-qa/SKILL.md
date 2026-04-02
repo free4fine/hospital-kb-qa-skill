@@ -31,7 +31,7 @@ description: |
 ### 2) 提问并检索证据
 
 ```bash
-.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "这里写用户问题" --top-k 12 --source-scope ./skills/hospital-kb-qa/references/source_scope.json --json
+.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "这里写用户问题" --top-k 12 --source-scope ./skills/hospital-kb-qa/references/source_scope.json --jsonl-root ./kb/jsonl --json
 ```
 
 返回字段：
@@ -44,6 +44,8 @@ description: |
 - `clarification_question`：需要澄清时的问题文本。
 - `suggested_terms`：候选标准术语列表。
 - `source_policy`：固定 `local_kb_only`。
+- `fallback_used`：是否触发 `jq/rg` 补检。
+- `evidence[].retrieval_method`：`sqlite_main | jq_rg_fallback`。
 
 ## Answer Policy
 
@@ -57,6 +59,8 @@ description: |
 强约束：
 
 - 只允许使用本地 `kb.sqlite` 与本地文档，不得联网检索、不得引用外部常识补全。
+- 检索主通道必须是 `sqlite`；仅当 `status=no_evidence` 候选场景时才允许触发 `jq/rg` 补检。
+- `jq/rg` 补检必须继续受 `source_scope` 限制，禁止跨白名单来源兜底。
 - 仅基于 `evidence` 输出结论。
 - 术语不确定时必须先澄清，且每次只问一个澄清问题。
 - `answerable=false` 时必须明确“证据不足，无法给出确定结论”。
