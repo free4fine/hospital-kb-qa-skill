@@ -880,6 +880,41 @@ def make_draft_answer(question: str, evidence: list[dict], answerable: bool, gap
     if not evidence:
         return "结论：证据不足，无法给出确定结论。\n依据（跨文档）：未检索到有效证据。"
 
+    table_hits = [ev for ev in evidence if ev.get("table_index") is not None]
+    if table_hits:
+        lines = [
+            "结论：命中表格证据，按原表完整输出。",
+            "依据（原表整表）：",
+        ]
+        by_table: dict[tuple[str, Any], list[dict[str, Any]]] = defaultdict(list)
+        for ev in evidence:
+            if ev.get("table_index") is None:
+                continue
+            by_table[(str(ev.get("source_file", "")), ev.get("table_index"))].append(ev)
+
+        for (source_file, table_index), rows in by_table.items():
+            lines.append(f"- {source_file} (table={table_index})")
+            def _row_sort_key(item: dict[str, Any]) -> tuple[int, int | str]:
+                row_idx = item.get("row_index")
+                try:
+                    return (0, int(row_idx))
+                except (TypeError, ValueError):
+                    return (1, str(row_idx) if row_idx is not None else "")
+
+            rows_sorted = sorted(rows, key=_row_sort_key)
+            for r in rows_sorted:
+                lines.append(f"  [row={r.get('row_index')}] {str(r.get('content', ''))}")
+
+        lines.append("引用：")
+        for i, ev in enumerate(table_hits, 1):
+            lines.append(f"[{i}] {ev['source_file']} (table={ev.get('table_index')}, row={ev.get('row_index')})")
+
+        if gaps:
+            lines.append("不确定点/缺口：")
+            for g in gaps:
+                lines.append(f"- {g}")
+        return "\n".join(lines)
+
     if answerable:
         lines = [
             "结论：根据当前知识库命中条款，可形成有证据支撑的回答。",
@@ -939,6 +974,78 @@ def has_process_evidence(evidence: list[dict]) -> bool:
         any(x in str(ev.get("content", "")) for x in ["申报流程", "流程", "步骤", "路径"])
         for ev in evidence
     )
+
+
+def expand_to_full_tables(conn: sqlite3.Connection, evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """若命中表格行，则扩展为同 source_file + table_index 的整表行。"""
+    if not evidence:
+        return evidence
+
+    table_seed: dict[tuple[str, Any], dict[str, Any]] = {}
+    for ev in evidence:
+        table_index = ev.get("table_index")
+        if table_index is None:
+            continue
+        source_file = str(ev.get("source_file", ""))
+        if not source_file:
+            continue
+        key = (source_file, table_index)
+        cur = table_seed.get(key)
+        if cur is None or float(ev.get("score", 0.0)) > float(cur.get("score", 0.0)):
+            table_seed[key] = {
+                "score": float(ev.get("score", 0.0)),
+                "retrieval_method": str(ev.get("retrieval_method", "sqlite_main")),
+            }
+
+    if not table_seed:
+        return evidence
+
+    cur = conn.cursor()
+    expanded: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any, Any]] = set()
+
+    for (source_file, table_index), meta in table_seed.items():
+        rows = cur.execute(
+            """
+            SELECT source_file, table_index, row_index, content, record_id
+            FROM records
+            WHERE source_file = ? AND table_index = ? AND type = 'table_row'
+            ORDER BY CASE WHEN row_index IS NULL THEN 1 ELSE 0 END, row_index, record_id
+            """,
+            (source_file, table_index),
+        ).fetchall()
+
+        if not rows:
+            rows = cur.execute(
+                """
+                SELECT source_file, table_index, row_index, content, record_id
+                FROM records
+                WHERE source_file = ? AND table_index = ?
+                ORDER BY CASE WHEN row_index IS NULL THEN 1 ELSE 0 END, row_index, record_id
+                """,
+                (source_file, table_index),
+            ).fetchall()
+
+        for row in rows:
+            content = str(row["content"] or "")
+            if not content:
+                continue
+            key = (row["source_file"], row["table_index"], row["row_index"], content)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(
+                {
+                    "source_file": row["source_file"],
+                    "table_index": row["table_index"],
+                    "row_index": row["row_index"],
+                    "content": content,
+                    "score": round(float(meta["score"]), 4),
+                    "retrieval_method": meta["retrieval_method"],
+                }
+            )
+
+    return expanded if expanded else evidence
 
 
 def assess_answerable(question: str, evidence: list[dict[str, Any]]) -> tuple[bool, list[str]]:
@@ -1043,6 +1150,7 @@ def query_kb(
                 jsonl_root=jsonl_root,
             )
             if fallback_evidence:
+                fallback_evidence = expand_to_full_tables(conn, fallback_evidence)
                 answerable, fb_gaps = assess_answerable(question, fallback_evidence)
                 merged_gaps = fb_gaps if answerable else list(dict.fromkeys(gaps + fb_gaps))
                 draft_answer = make_draft_answer(question, fallback_evidence, answerable, merged_gaps)
@@ -1252,6 +1360,7 @@ def query_kb(
         if not evidence:
             return resolve_no_evidence(["知识库中未检索到可用证据。"])
 
+        evidence = expand_to_full_tables(conn, evidence)
         answerable, gaps = assess_answerable(question, evidence)
         draft_answer = make_draft_answer(question, evidence, answerable, gaps)
         status = "answered" if answerable else "no_evidence"
