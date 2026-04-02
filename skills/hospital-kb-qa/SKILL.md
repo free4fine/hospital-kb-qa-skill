@@ -34,6 +34,68 @@ description: |
 .venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "这里写用户问题" --top-k 12 --source-scope ./skills/hospital-kb-qa/references/source_scope.json --jsonl-root ./kb/jsonl --json
 ```
 
+## Fixed Execution State Machine (强制)
+
+所有模型必须按以下状态机执行，不得跳步，不得改写成自由探索流程。
+
+### Layer 1: Retrieval（证据检索层）
+
+1. 先解析问题并结构化：
+   - `query_type`
+   - `scope`（标准口径）
+   - `level`（级别）
+   - `topic_keywords`
+   - `need_complete_output`（是否要求完整清单）
+2. 先做术语/口径澄清判定：
+   - 口径不唯一
+   - 等级不唯一且问题依赖等级
+   - 同时引用多个冲突标准名
+   命中任一条件：只输出一个澄清问题并停止。
+3. 检索顺序固定：
+   - 先按 `source_scope` 过滤 `source_file`
+   - 再执行 `sqlite` 检索（FTS/结构化）
+   - 仅当 `status=no_evidence` 才允许 `jq/rg` 补检
+
+### Layer 2: Structure Control（结构控制层）
+
+根据 `query_type` 决定输出结构：
+
+1. `fact`：结论 -> 依据 -> 引用 -> 缺口
+2. `list` / `filter_list`：完整条目列表 -> 引用 -> 缺口（不得摘要替代）
+3. `compare`：按口径 A/B 分别列依据 -> 对比结论 -> 引用 -> 缺口
+4. `locate`：定位结果（文档/章节/表/行）-> 原文片段 -> 引用
+5. `theme_summary`：主题归纳 -> 支撑证据 -> 引用 -> 缺口
+
+### Layer 3: Constrained Generation（受限生成层）
+
+1. 只允许基于 `evidence` 生成回答，禁止知识库外补全。
+2. `list/filter_list` 必须完整展开，不得仅给概述。
+3. `answerable=false` 必须明确“证据不足，无法给出确定结论”。
+4. `status=no_evidence` 禁止给申报流程、实施路径等外延建议。
+
+### Stop Conditions（停止条件）
+
+1. 每个问题最多：`1 次 sqlite 主检索 + 1 次 jq/rg 补检`。
+2. 若仍无证据：直接返回 `no_evidence`，禁止继续改写问题重试。
+3. 若需要澄清：只问 1 个澄清问题并停止等待用户确认。
+
+## Query Type Routing Rules (可执行约束)
+
+按以下优先级进行 `query_type` 路由（从上到下匹配，命中即停止）：
+
+1. `filter_list`：出现 `清单|完整|全部|逐条|明细|打分表|excel|xlsx|附件`
+2. `compare`：出现 `对比|比较|差异|区别|分别|哪个更`
+3. `locate`：出现 `哪一条|哪一行|哪个章节|附表|附件|条款位置|定位`
+4. `theme_summary`：出现 `汇总|归纳|总览|整体情况`
+5. 其他默认 `fact`
+
+补充规则：
+
+1. `filter_list` 必须走 Checklist Scope Map 对应来源与章节。
+2. 用户指定单一口径时，禁止跨口径召回。
+3. 用户明确要求 `excel/xlsx` 时，必须输出可下载附件（正文仅摘要）。
+4. 多口径问题先分口径检索，再合并渲染，禁止混合后再猜测归类。
+
 返回字段：
 
 - `status`：`clarification_required | answered | no_evidence`。
