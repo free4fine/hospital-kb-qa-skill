@@ -59,6 +59,26 @@ DEFAULT_TERM_LEXICON = {
     ],
     "ambiguous_level_domains": ["电子病历", "互联互通", "智慧服务", "智慧管理"],
 }
+DEFAULT_SOURCE_SCOPE = {
+    "scopes": [
+        {
+            "canonical_term": "电子病历",
+            "source_file_patterns": ["电子病历系统应用水平分级评价标准_试行_2018版"],
+        },
+        {
+            "canonical_term": "互联互通",
+            "source_file_patterns": ["医院信息互联互通标准化成熟度测评方案_2020年版"],
+        },
+        {
+            "canonical_term": "智慧服务",
+            "source_file_patterns": ["医院智慧服务分级评估标准体系_试行_20190801"],
+        },
+        {
+            "canonical_term": "智慧管理",
+            "source_file_patterns": ["医院智慧管理分级评估具体要求"],
+        },
+    ]
+}
 ZH_NUM = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 NUM_ZH = {v: k for k, v in ZH_NUM.items()}
 
@@ -152,6 +172,40 @@ def load_term_lexicon(lexicon_path: Path | None) -> dict[str, Any]:
         return DEFAULT_TERM_LEXICON
 
     return data
+
+
+def load_source_scope(scope_path: Path | None) -> dict[str, Any]:
+    """加载口径来源白名单；若文件不可用则回退到内置默认配置。"""
+    if scope_path is None or not scope_path.exists():
+        return DEFAULT_SOURCE_SCOPE
+
+    try:
+        data = json.loads(scope_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_SOURCE_SCOPE
+
+    if not isinstance(data, dict):
+        return DEFAULT_SOURCE_SCOPE
+    scopes = data.get("scopes")
+    if not isinstance(scopes, list):
+        return DEFAULT_SOURCE_SCOPE
+
+    valid = []
+    for row in scopes:
+        if not isinstance(row, dict):
+            continue
+        canonical = str(row.get("canonical_term", "")).strip()
+        patterns = row.get("source_file_patterns", [])
+        if not canonical or not isinstance(patterns, list):
+            continue
+        clean_patterns = [str(x).strip() for x in patterns if str(x).strip()]
+        if not clean_patterns:
+            continue
+        valid.append({"canonical_term": canonical, "source_file_patterns": clean_patterns})
+
+    if not valid:
+        return DEFAULT_SOURCE_SCOPE
+    return {"scopes": valid}
 
 
 def extract_level_token(question: str) -> str | None:
@@ -318,6 +372,20 @@ def term_gate(question: str, lexicon: dict[str, Any]) -> dict[str, Any] | None:
     matched_domains, alias_hits = detect_domains_and_alias_hits(q, lexicon)
 
     if alias_hits:
+        # 规则豁免：这些表达与“互联互通”视作同义，不需要额外澄清。
+        interop_aliases = {"信息互联", "互联信息", "信息互通", "互联信息化", "信息互联互通"}
+        actionable_alias_hits: list[tuple[str, str]] = []
+        for alias, canonical in alias_hits:
+            # 已明确写出标准词时，不再触发别名澄清。
+            if canonical in q:
+                continue
+            if canonical == "互联互通" and alias in interop_aliases:
+                continue
+            actionable_alias_hits.append((alias, canonical))
+
+        alias_hits = actionable_alias_hits
+
+    if alias_hits:
         # 仅问一个澄清问题，避免发散。
         alias, canonical = alias_hits[0]
         nearby_level = find_nearby_level_token(q, alias) or level_token
@@ -346,7 +414,68 @@ def term_gate(question: str, lexicon: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[dict[int, float], dict[int, sqlite3.Row]]:
+def resolve_source_patterns(
+    question: str,
+    lexicon: dict[str, Any],
+    source_scope: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """根据问题命中的口径，解析允许检索的 source_file 模式。"""
+    q = normalize_space(question)
+    matched_domains, _ = detect_domains_and_alias_hits(q, lexicon)
+    if not matched_domains:
+        return [], []
+
+    scope_map = build_source_scope_map(source_scope)
+
+    missing_domains: list[str] = []
+    patterns: list[str] = []
+    for domain in sorted(matched_domains):
+        p = scope_map.get(domain)
+        if not p:
+            missing_domains.append(domain)
+            continue
+        patterns.extend(p)
+
+    uniq_patterns: list[str] = []
+    seen = set()
+    for p in patterns:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq_patterns.append(p)
+    return uniq_patterns, missing_domains
+
+
+def build_source_scope_map(source_scope: dict[str, Any]) -> dict[str, list[str]]:
+    """将 source_scope 配置转换为 canonical_term -> patterns 映射。"""
+    scope_map: dict[str, list[str]] = {}
+    for row in source_scope.get("scopes", []):
+        if not isinstance(row, dict):
+            continue
+        canonical = str(row.get("canonical_term", "")).strip()
+        patterns = row.get("source_file_patterns", [])
+        if not canonical or not isinstance(patterns, list):
+            continue
+        clean_patterns = [str(x).strip() for x in patterns if str(x).strip()]
+        if not clean_patterns:
+            continue
+        scope_map[canonical] = clean_patterns
+    return scope_map
+
+
+def source_matches_patterns(source_file: str, patterns: list[str]) -> bool:
+    """判断 source_file 是否命中指定口径来源模式。"""
+    if not patterns:
+        return False
+    return any(p in source_file for p in patterns)
+
+
+def fts_retrieve(
+    conn: sqlite3.Connection,
+    question: str,
+    limit: int,
+    source_patterns: list[str] | None = None,
+) -> tuple[dict[int, float], dict[int, sqlite3.Row]]:
     """基于 FTS 召回候选记录，并输出 record_id -> score 映射。
 
     返回两个结构：
@@ -357,6 +486,13 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
     terms = extract_terms(question)
     scores: dict[int, float] = {}
     rows_map: dict[int, sqlite3.Row] = {}
+    source_patterns = source_patterns or []
+
+    fts_source_clause = ""
+    fts_source_params: list[Any] = []
+    if source_patterns:
+        fts_source_clause = " AND (" + " OR ".join(["r.source_file LIKE ?"] * len(source_patterns)) + ")"
+        fts_source_params = [f"%{p}%" for p in source_patterns]
 
     if terms:
         # 限制关键词数量，避免 FTS 查询表达式过长。
@@ -367,7 +503,7 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
     if fts_query:
         try:
             rows = cur.execute(
-                """
+                f"""
                 SELECT
                     r.record_id,
                     r.source_file,
@@ -379,10 +515,11 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
                 FROM records_fts
                 JOIN records r ON r.record_id = CAST(records_fts.record_id AS INTEGER)
                 WHERE records_fts MATCH ?
+                {fts_source_clause}
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, limit),
+                (fts_query, *fts_source_params, limit),
             ).fetchall()
 
             for row in rows:
@@ -403,8 +540,13 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
     like_terms = terms[:8] if terms else [question.strip()]
     like_terms = [t for t in like_terms if t]
     if like_terms:
-        where = " OR ".join(["content LIKE ?"] * len(like_terms))
-        params = [f"%{t}%" for t in like_terms] + [limit]
+        where_parts = ["(" + " OR ".join(["content LIKE ?"] * len(like_terms)) + ")"]
+        params: list[Any] = [f"%{t}%" for t in like_terms]
+        if source_patterns:
+            where_parts.append("(" + " OR ".join(["source_file LIKE ?"] * len(source_patterns)) + ")")
+            params.extend([f"%{p}%" for p in source_patterns])
+        where = " AND ".join(where_parts)
+        params.append(limit)
         rows = cur.execute(
             f"""
             SELECT record_id, source_file, type, table_index, row_index, content
@@ -428,7 +570,12 @@ def fts_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> tuple[d
     return scores, rows_map
 
 
-def ngram_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> dict[int, float]:
+def ngram_retrieve(
+    conn: sqlite3.Connection,
+    question: str,
+    limit: int,
+    source_patterns: list[str] | None = None,
+) -> dict[int, float]:
     """基于字符 n-gram 的重叠度召回，补足关键词检索的漏召回。"""
     q_grams = char_ngrams(question)
     if not q_grams:
@@ -439,6 +586,19 @@ def ngram_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> dict[
         return {}
 
     cur = conn.cursor()
+    source_patterns = source_patterns or []
+    allowed_ids: set[int] | None = None
+    if source_patterns:
+        source_where = "(" + " OR ".join(["source_file LIKE ?"] * len(source_patterns)) + ")"
+        source_params = [f"%{p}%" for p in source_patterns]
+        rows = cur.execute(
+            f"SELECT record_id FROM records WHERE {source_where}",
+            source_params,
+        ).fetchall()
+        allowed_ids = {int(row["record_id"]) for row in rows}
+        if not allowed_ids:
+            return {}
+
     record_overlap: dict[int, float] = defaultdict(float)
 
     # 分批查询，避免 IN 子句过长。
@@ -453,6 +613,8 @@ def ngram_retrieve(conn: sqlite3.Connection, question: str, limit: int) -> dict[
 
         for row in rows:
             rid = int(row["record_id"])
+            if allowed_ids is not None and rid not in allowed_ids:
+                continue
             gram = row["gram"]
             tf = int(row["tf"])
             record_overlap[rid] += min(tf, q_grams.get(gram, 0))
@@ -636,10 +798,12 @@ def query_kb(
     question: str,
     top_k: int,
     lexicon_path: Path | None = None,
+    source_scope_path: Path | None = None,
 ) -> dict:
     """执行完整检索链路，返回可回答性判断与证据。"""
     question = normalize_space(question)
     lexicon = load_term_lexicon(lexicon_path)
+    source_scope = load_source_scope(source_scope_path)
     if not question:
         return {
             "status": "no_evidence",
@@ -656,16 +820,35 @@ def query_kb(
     if gated is not None:
         return gated
 
+    matched_domains, _ = detect_domains_and_alias_hits(question, lexicon)
+    source_scope_map = build_source_scope_map(source_scope)
+    source_patterns, missing_domains = resolve_source_patterns(question, lexicon, source_scope)
+    if missing_domains:
+        gaps = [f"口径来源白名单未配置：{', '.join(missing_domains)}。"]
+        return {
+            "status": "no_evidence",
+            "answerable": False,
+            "evidence": [],
+            "draft_answer": make_draft_answer(question, [], False, gaps),
+            "gaps": gaps,
+            "clarification_question": None,
+            "suggested_terms": [],
+            "source_policy": SOURCE_POLICY,
+        }
+
     conn = sqlite3.connect(str(kb_path))
     conn.row_factory = sqlite3.Row
     try:
         retrieval_question = augment_question_for_retrieval(question, lexicon)
-        kw_scores, kw_rows = fts_retrieve(conn, retrieval_question, max(20, top_k * 4))
-        ng_scores = ngram_retrieve(conn, retrieval_question, max(20, top_k * 6))
+        kw_scores, kw_rows = fts_retrieve(conn, retrieval_question, max(20, top_k * 4), source_patterns)
+        ng_scores = ngram_retrieve(conn, retrieval_question, max(20, top_k * 6), source_patterns)
         combined = combine_scores(kw_scores, ng_scores)
 
         if not combined:
-            gaps = ["知识库中未检索到相关片段。"]
+            if source_patterns:
+                gaps = ["指定口径来源范围内未检索到相关片段。"]
+            else:
+                gaps = ["知识库中未检索到相关片段。"]
             return {
                 "status": "no_evidence",
                 "answerable": False,
@@ -682,7 +865,10 @@ def query_kb(
             key=lambda rid: (combined[rid], kw_scores.get(rid, 0.0), ng_scores.get(rid, 0.0)),
             reverse=True,
         )
-        need_ids = pre_ranked_ids[: max(top_k * 4, 40)]
+        need_cap = max(top_k * 4, 40)
+        if len(matched_domains) > 1:
+            need_cap = max(need_cap, top_k * 12, 200)
+        need_ids = pre_ranked_ids[:need_cap]
         rows_cache = dict(kw_rows)
         missing = [rid for rid in need_ids if rid not in rows_cache]
         if missing:
@@ -729,6 +915,9 @@ def query_kb(
         top_combined_score = float(adjusted_scores.get(ranked_ids[0], 0.0))
         # 仅保留相对高分片段：绝对下限 + 相对 top 分数阈值。
         min_keep_score = max(0.08, top_combined_score * 0.35)
+        collect_limit = top_k
+        if len(matched_domains) > 1:
+            collect_limit = max(top_k * 3, 36)
         for rid in ranked_ids:
             row = rows_cache.get(rid)
             if row is None:
@@ -748,8 +937,106 @@ def query_kb(
                     "score": round(score, 4),
                 }
             )
-            if len(evidence) >= top_k:
+            if len(evidence) >= collect_limit:
                 break
+
+        if len(matched_domains) > 1:
+            domain_patterns = {
+                d: source_scope_map.get(d, [])
+                for d in sorted(matched_domains)
+                if source_scope_map.get(d)
+            }
+            if domain_patterns:
+                covered_domains = {
+                    d: any(source_matches_patterns(str(ev["source_file"]), pats) for ev in evidence)
+                    for d, pats in domain_patterns.items()
+                }
+                missing_domains_in_evidence = [d for d, ok in covered_domains.items() if not ok]
+
+                # 多口径兜底：若某口径未覆盖，从该口径白名单来源回填至少一条证据。
+                if missing_domains_in_evidence:
+                    existing_keys = {
+                        (ev.get("source_file"), ev.get("table_index"), ev.get("row_index"), ev.get("content"))
+                        for ev in evidence
+                    }
+                    for rid in ranked_ids:
+                        if not missing_domains_in_evidence:
+                            break
+                        row = rows_cache.get(rid)
+                        if row is None:
+                            continue
+                        source_file = str(row["source_file"] or "")
+                        hit_missing = [
+                            d
+                            for d in missing_domains_in_evidence
+                            if source_matches_patterns(source_file, domain_patterns.get(d, []))
+                        ]
+                        if not hit_missing:
+                            continue
+
+                        content = str(row["content"] or "")
+                        if q_level_vars and ("等级要求" in content) and (not any(v in content for v in q_level_vars)):
+                            continue
+
+                        score = float(adjusted_scores.get(rid, 0.0))
+                        if score < 0.03:
+                            continue
+
+                        key = (source_file, row["table_index"], row["row_index"], content)
+                        if key in existing_keys:
+                            continue
+                        existing_keys.add(key)
+                        evidence.append(
+                            {
+                                "source_file": source_file,
+                                "table_index": row["table_index"],
+                                "row_index": row["row_index"],
+                                "content": content,
+                                "score": round(score, 4),
+                            }
+                        )
+                        missing_domains_in_evidence = [
+                            d
+                            for d in missing_domains_in_evidence
+                            if not source_matches_patterns(source_file, domain_patterns.get(d, []))
+                        ]
+
+                evidence_sorted = sorted(evidence, key=lambda x: x["score"], reverse=True)
+                picked: list[dict[str, Any]] = []
+                seen_keys: set[tuple[Any, Any, Any, Any]] = set()
+
+                # 每个口径至少保留一条代表证据（若存在）。
+                for domain, patterns in domain_patterns.items():
+                    for ev in evidence_sorted:
+                        if not source_matches_patterns(str(ev["source_file"]), patterns):
+                            continue
+                        key = (
+                            ev.get("source_file"),
+                            ev.get("table_index"),
+                            ev.get("row_index"),
+                            ev.get("content"),
+                        )
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        picked.append(ev)
+                        break
+
+                # 其余按分数补齐。
+                for ev in evidence_sorted:
+                    if len(picked) >= top_k:
+                        break
+                    key = (
+                        ev.get("source_file"),
+                        ev.get("table_index"),
+                        ev.get("row_index"),
+                        ev.get("content"),
+                    )
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    picked.append(ev)
+                evidence = picked[:top_k]
 
         if not evidence:
             gaps = ["知识库中未检索到可用证据。"]
@@ -823,10 +1110,16 @@ def main() -> None:
         default=Path("./skills/hospital-kb-qa/references/term_lexicon.json"),
         help="Path to term lexicon json",
     )
+    parser.add_argument(
+        "--source-scope",
+        type=Path,
+        default=Path("./skills/hospital-kb-qa/references/source_scope.json"),
+        help="Path to source scope json",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     args = parser.parse_args()
 
-    result = query_kb(args.kb, args.question, args.top_k, args.term_lexicon)
+    result = query_kb(args.kb, args.question, args.top_k, args.term_lexicon, args.source_scope)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False))

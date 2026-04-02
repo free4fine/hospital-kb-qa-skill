@@ -31,7 +31,7 @@ description: |
 ### 2) 提问并检索证据
 
 ```bash
-.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "这里写用户问题" --top-k 12 --json
+.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "这里写用户问题" --top-k 12 --source-scope ./skills/hospital-kb-qa/references/source_scope.json --json
 ```
 
 返回字段：
@@ -63,9 +63,47 @@ description: |
 - `status=no_evidence` 时禁止补充申报流程、实施路径等知识库外内容。
 - 不输出无证据支撑的推断。
 
+## Source Scope Filter (强制)
+
+查询顺序必须固定为：
+
+1. 先根据口径映射过滤 `source_file`
+2. 再执行 FTS / n-gram 检索与排序
+
+口径来源映射文件：
+
+- `skills/hospital-kb-qa/references/source_scope.json`
+
+## Checklist Scope Map (章节索引白名单)
+
+清单请求时，必须优先在以下章节范围内抽取明细；禁止跨口径扩展到未指定章节。
+
+1. 电子病历分级标准清单  
+   来源：`国家卫健委_电子病历系统应用水平分级评价标准_试行_2018版`  
+   章节：`附表3`
+
+2. 信息系统互联互通分级标准清单  
+   来源：`国家医疗健康信息医院信息互联互通标准化成熟度测评方案_2020年版`  
+   章节：`分级标准清单相关表格（按用户等级要求筛选）`
+
+3. 智慧服务分级标准清单  
+   来源：`医院智慧服务分级评估标准体系_试行_20190801`  
+   章节：`附件3`
+
+4. 智慧管理分级标准清单  
+   来源：`医院智慧管理分级评估具体要求`  
+   章节：`分级标准清单相关章节（按用户等级要求筛选）`
+
+执行要求：
+
+- 若用户指定口径，只在对应白名单来源与章节抽取。
+- 若用户同时指定多个口径，分别抽取后合并输出。
+- 若白名单范围未命中，必须明确“指定范围未检索到明细”，不得改去其它来源补齐。
+
 ## Notes
 
 - 首版接入范围：`docx + jsonl`（`.doc` 暂不自动转换）。
 - 如果源文档更新，先重新执行 `ingest` 再 `query`。
 - 术语词表文件：`skills/hospital-kb-qa/references/term_lexicon.json`。
+- 口径来源白名单：`skills/hospital-kb-qa/references/source_scope.json`。
 - 依赖项目级虚拟环境 `.venv`。

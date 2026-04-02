@@ -1,0 +1,28 @@
+{
+  "scopes": [
+    {
+      "canonical_term": "电子病历",
+      "source_file_patterns": [
+        "电子病历系统应用水平分级评价标准_试行_2018版"
+      ]
+    },
+    {
+      "canonical_term": "互联互通",
+      "source_file_patterns": [
+        "医院信息互联互通标准化成熟度测评方案_2020年版"
+      ]
+    },
+    {
+      "canonical_term": "智慧服务",
+      "source_file_patterns": [
+        "医院智慧服务分级评估标准体系_试行_20190801"
+      ]
+    },
+    {
+      "canonical_term": "智慧管理",
+      "source_file_patterns": [
+        "医院智慧管理分级评估具体要求"
+      ]
+    }
+  ]
+}
