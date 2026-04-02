@@ -1,28 +1,39 @@
-# hospital-kb-qa-skill（CLI 可集成）
+# hospital-kb-qa-skill
 
-本仓库提供医卫行业信息化政策、标准文档的本地知识库能力，支持：
+本项目提供“医院信息化标准知识库”本地检索能力，定位是可审计、可复现、可控输出的问答后端。
+
+当前主策略：
+
+1. `sqlite` 主检索（FTS + ngram）
+2. `source_scope` 口径白名单先过滤
+3. 仅在 `no_evidence` 时触发 `jq/rg` 本地补检
+4. 仅基于证据输出，不做知识库外补全
+
+## 核心能力
 
 - `.docx + .jsonl` 批量入库
-- 本地 SQLite 索引（关键词 + ngram 补召回）
-- 检索后按证据输出回答草稿（含来源定位）
+- 统一索引：`records` / `records_fts` / `ngrams`
+- 查询状态机：`clarification_required | answered | no_evidence`
+- 证据可追溯：`source_file + table_index + row_index`
+- 表格命中强制整表输出（代码级）
 
-适用于在 opencode、openclaw 或其他可执行命令的平台中作为问答后端调用。
+## 项目结构
 
-## 目录结构
-
-- `scripts/docx_to_jsonl.py`：Word 转 JSONL
-- `scripts/kb_ingest.py`：构建/更新知识库索引
-- `scripts/kb_query.py`：问题检索与证据化输出
+- `scripts/docx_to_jsonl.py`：Word 转 JSONL（标题/段落/列表/表格行）
+- `scripts/kb_ingest.py`：入库与索引构建
+- `scripts/kb_query.py`：查询、证据融合、状态输出
+- `skills/hospital-kb-qa/SKILL.md`：Skill 约束与执行协议
+- `skills/hospital-kb-qa/references/source_scope.json`：口径来源白名单
 - `kb/jsonl/`：标准化中间数据
-- `kb/kb.sqlite`：知识库索引数据库
-- `skills/hospital-kb-qa/SKILL.md`：本地 skill 说明
+- `kb/kb.sqlite`：本地索引库
+- `docs/hospital-kb-qa-design.md`：应用设计文档
 
 ## 环境要求
 
 - Python 3.10+
-- 项目级虚拟环境 `.venv`
+- 必须使用项目级虚拟环境 `.venv`
 
-## 安装（git clone）
+## 安装
 
 ```bash
 git clone https://github.com/free4fine/hospital-kb-qa-skill.git
@@ -33,7 +44,7 @@ python3 -m venv .venv
 
 ## 快速开始
 
-### 1) 构建索引
+### 1) 构建/更新索引
 
 ```bash
 .venv/bin/python scripts/kb_ingest.py --kb-root ./kb --input-root . --include-docx --include-jsonl
@@ -42,45 +53,82 @@ python3 -m venv .venv
 ### 2) 查询
 
 ```bash
-.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "医院应用信息化评估分为多少级" --top-k 12 --json
+.venv/bin/python scripts/kb_query.py \
+  --kb ./kb/kb.sqlite \
+  --question "智慧服务 诊前服务，急救衔接，二级有什么要求" \
+  --top-k 12 \
+  --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
+  --jsonl-root ./kb/jsonl \
+  --json
 ```
 
-## 查询返回 JSON 契约
+### 3) 关闭补检（调试/验收）
 
-`kb_query.py --json` 返回字段：
+```bash
+.venv/bin/python scripts/kb_query.py \
+  --kb ./kb/kb.sqlite \
+  --question "..." \
+  --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
+  --no-jq-rg-fallback \
+  --json
+```
 
-- `answerable`：`bool`，是否达到可回答阈值
-- `evidence`：证据数组，每项包含
+## 查询输出契约（JSON）
+
+`scripts/kb_query.py --json` 返回：
+
+- `status`：`clarification_required | answered | no_evidence`
+- `answerable`：是否达到可回答阈值
+- `evidence[]`：
   - `source_file`
   - `table_index`
   - `row_index`
   - `content`
   - `score`
-- `draft_answer`：按“结论+依据+引用+缺口”组织的回答草稿
-- `gaps`：证据不足或不确定点
+  - `retrieval_method`：`sqlite_main | jq_rg_fallback`
+- `draft_answer`：证据驱动回答草稿
+- `gaps[]`：缺口与不确定点
+- `clarification_question`：澄清问题（可空）
+- `suggested_terms[]`：建议术语（可空）
+- `source_policy`：固定 `local_kb_only`
+- `fallback_used`：是否触发补检
 
-## 在其他平台接入（opencode/openclaw）
+## 当前强约束
 
-平台只需配置一个命令工具，传入用户问题并读取 stdout JSON：
+1. 只允许本地知识库，不联网，不外部补全。
+2. 先按 `source_scope` 过滤，再检索。
+3. 主通道为 `sqlite`，仅 `no_evidence` 时补检。
+4. 命中表格行时，自动按 `source_file + table_index` 回填整表并按原顺序输出。
+
+## 典型接入方式（Agent/平台）
+
+平台配置单命令即可：
 
 ```bash
-.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "{{user_input}}" --top-k 12 --json
+.venv/bin/python scripts/kb_query.py \
+  --kb ./kb/kb.sqlite \
+  --question "{{user_input}}" \
+  --top-k 12 \
+  --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
+  --jsonl-root ./kb/jsonl \
+  --json
 ```
 
-建议平台侧渲染逻辑：
+建议前端渲染：
 
-1. 若 `answerable=true`：展示 `draft_answer`，并展开 `evidence` 引用。
-2. 若 `answerable=false`：展示 `draft_answer` 与 `gaps`，提示用户收敛问题范围。
+1. `status=clarification_required`：只展示澄清问题，等待用户确认。
+2. `status=answered`：展示 `draft_answer` 与 `evidence` 引用。
+3. `status=no_evidence`：展示 `draft_answer` + `gaps`，提示用户收敛口径或补充条件。
 
-## 数据更新流程
+## 数据更新
 
-当源文档更新后，重新执行一次入库命令：
+源文档更新后，重新执行：
 
 ```bash
 .venv/bin/python scripts/kb_ingest.py --kb-root ./kb --input-root . --include-docx --include-jsonl
 ```
 
-## 注意事项
+## 说明
 
-- 当前自动入库范围：`.docx + .jsonl`（`.doc` 暂不自动转换）。
-- 本仓库包含公开标准材料构建的数据索引，可公开分发。
+- 当前自动接入范围：`.docx + .jsonl`（`.doc` 暂不自动转换）。
+- 详细设计见 [docs/hospital-kb-qa-design.md](docs/hospital-kb-qa-design.md)。
