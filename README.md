@@ -19,14 +19,16 @@
 
 ## 项目结构
 
-- `scripts/docx_to_jsonl.py`：Word 转 JSONL（标题/段落/列表/表格行）
-- `scripts/kb_ingest.py`：入库与索引构建
-- `scripts/kb_query.py`：查询、证据融合、状态输出
+- `skills/hospital-kb-qa/scripts/docx_to_jsonl.py`：Word 转 JSONL（标题/段落/列表/表格行）
+- `skills/hospital-kb-qa/scripts/kb_ingest.py`：入库与索引构建
+- `skills/hospital-kb-qa/scripts/kb_query.py`：查询、证据融合、状态输出
 - `skills/hospital-kb-qa/SKILL.md`：Skill 约束与执行协议
 - `skills/hospital-kb-qa/references/source_scope.json`：口径来源白名单
-- `kb/jsonl/`：标准化中间数据
-- `kb/kb.sqlite`：本地索引库
+- `skills/hospital-kb-qa/references/term_lexicon.json`：术语词表（可维护配置）
+- `skills/hospital-kb-qa/kb/jsonl/`：标准化中间数据
+- `skills/hospital-kb-qa/kb/kb.sqlite`：本地索引库
 - `docs/hospital-kb-qa-design.md`：应用设计文档
+- `docs/hospital-kb-qa-script-boundary.md`：脚本与模型职责边界（防漂移）
 
 ## 环境要求
 
@@ -47,26 +49,30 @@ python3 -m venv .venv
 ### 1) 构建/更新索引
 
 ```bash
-.venv/bin/python scripts/kb_ingest.py --kb-root ./kb --input-root . --include-docx --include-jsonl
+.venv/bin/python skills/hospital-kb-qa/scripts/kb_ingest.py \
+  --kb-root ./skills/hospital-kb-qa/kb \
+  --input-root . \
+  --include-docx \
+  --include-jsonl
 ```
 
 ### 2) 查询
 
 ```bash
-.venv/bin/python scripts/kb_query.py \
-  --kb ./kb/kb.sqlite \
+.venv/bin/python skills/hospital-kb-qa/scripts/kb_query.py \
+  --kb ./skills/hospital-kb-qa/kb/kb.sqlite \
   --question "智慧服务 诊前服务，急救衔接，二级有什么要求" \
   --top-k 12 \
   --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
-  --jsonl-root ./kb/jsonl \
+  --jsonl-root ./skills/hospital-kb-qa/kb/jsonl \
   --json
 ```
 
 ### 3) 关闭补检（调试/验收）
 
 ```bash
-.venv/bin/python scripts/kb_query.py \
-  --kb ./kb/kb.sqlite \
+.venv/bin/python skills/hospital-kb-qa/scripts/kb_query.py \
+  --kb ./skills/hospital-kb-qa/kb/kb.sqlite \
   --question "..." \
   --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
   --no-jq-rg-fallback \
@@ -75,7 +81,7 @@ python3 -m venv .venv
 
 ## 查询输出契约（JSON）
 
-`scripts/kb_query.py --json` 返回：
+`skills/hospital-kb-qa/scripts/kb_query.py --json` 返回：
 
 - `status`：`clarification_required | answered | no_evidence`
 - `answerable`：是否达到可回答阈值
@@ -105,12 +111,12 @@ python3 -m venv .venv
 平台配置单命令即可：
 
 ```bash
-.venv/bin/python scripts/kb_query.py \
-  --kb ./kb/kb.sqlite \
+.venv/bin/python skills/hospital-kb-qa/scripts/kb_query.py \
+  --kb ./skills/hospital-kb-qa/kb/kb.sqlite \
   --question "{{user_input}}" \
   --top-k 12 \
   --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
-  --jsonl-root ./kb/jsonl \
+  --jsonl-root ./skills/hospital-kb-qa/kb/jsonl \
   --json
 ```
 
@@ -125,10 +131,15 @@ python3 -m venv .venv
 源文档更新后，重新执行：
 
 ```bash
-.venv/bin/python scripts/kb_ingest.py --kb-root ./kb --input-root . --include-docx --include-jsonl
+.venv/bin/python skills/hospital-kb-qa/scripts/kb_ingest.py \
+  --kb-root ./skills/hospital-kb-qa/kb \
+  --input-root . \
+  --include-docx \
+  --include-jsonl
 ```
 
 ## 说明
 
 - 当前自动接入范围：`.docx + .jsonl`（`.doc` 暂不自动转换）。
 - 详细设计见 [docs/hospital-kb-qa-design.md](docs/hospital-kb-qa-design.md)。
+- 职责边界见 [docs/hospital-kb-qa-script-boundary.md](docs/hospital-kb-qa-script-boundary.md)。

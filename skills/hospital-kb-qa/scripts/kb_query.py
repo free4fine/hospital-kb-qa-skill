@@ -22,6 +22,13 @@ from typing import Any
 
 
 SOURCE_POLICY = "local_kb_only"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_DIR.parent
+DEFAULT_KB_PATH = SKILL_ROOT / "kb" / "kb.sqlite"
+DEFAULT_TERM_LEXICON_PATH = SKILL_ROOT / "references" / "term_lexicon.json"
+DEFAULT_SOURCE_SCOPE_PATH = SKILL_ROOT / "references" / "source_scope.json"
+DEFAULT_JSONL_ROOT = SKILL_ROOT / "kb" / "jsonl"
+
 DEFAULT_TERM_LEXICON = {
     "canonical_terms": [
         {
@@ -1372,25 +1379,30 @@ def query_kb(
 def main() -> None:
     """命令行入口。"""
     parser = argparse.ArgumentParser(description="Query local KB sqlite and return evidence-grounded answer draft.")
-    parser.add_argument("--kb", type=Path, required=True, help="Path to kb sqlite, e.g. ./kb/kb.sqlite")
+    parser.add_argument(
+        "--kb",
+        type=Path,
+        default=DEFAULT_KB_PATH,
+        help=f"Path to kb sqlite, default {DEFAULT_KB_PATH}",
+    )
     parser.add_argument("--question", required=True, help="User question")
     parser.add_argument("--top-k", type=int, default=12, help="Number of evidence rows")
     parser.add_argument(
         "--term-lexicon",
         type=Path,
-        default=Path("./skills/hospital-kb-qa/references/term_lexicon.json"),
+        default=DEFAULT_TERM_LEXICON_PATH,
         help="Path to term lexicon json",
     )
     parser.add_argument(
         "--source-scope",
         type=Path,
-        default=Path("./skills/hospital-kb-qa/references/source_scope.json"),
+        default=DEFAULT_SOURCE_SCOPE_PATH,
         help="Path to source scope json",
     )
     parser.add_argument(
         "--jsonl-root",
         type=Path,
-        default=Path("./kb/jsonl"),
+        default=DEFAULT_JSONL_ROOT,
         help="Path to JSONL directory for jq/rg fallback retrieval",
     )
     parser.add_argument(

@@ -24,6 +24,9 @@ from typing import Iterable
 from docx_to_jsonl import convert as convert_docx_to_jsonl
 
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_DIR.parent
+DEFAULT_KB_ROOT = SKILL_ROOT / "kb"
 
 
 @dataclass
@@ -344,7 +347,12 @@ def prepare_inputs(args) -> list[PreparedDoc]:
 def main() -> None:
     """命令行入口。"""
     parser = argparse.ArgumentParser(description="Build local KB index from docx/jsonl files.")
-    parser.add_argument("--kb-root", type=Path, default=Path("./kb"), help="KB output root, default ./kb")
+    parser.add_argument(
+        "--kb-root",
+        type=Path,
+        default=DEFAULT_KB_ROOT,
+        help=f"KB output root, default {DEFAULT_KB_ROOT}",
+    )
     parser.add_argument("--input-root", type=Path, default=Path("."), help="Input root directory")
     parser.add_argument("--include-docx", action="store_true", help="Include .docx source files")
     parser.add_argument("--include-jsonl", action="store_true", help="Include .jsonl source files")

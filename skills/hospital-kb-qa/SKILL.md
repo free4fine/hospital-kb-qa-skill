@@ -1,189 +1,165 @@
 ---
 name: hospital-kb-qa
 description: |
-  访问医卫信息化相关标准知识库并进行多文档检索问答。适用于：政策条款查询、跨文档比对、等级要求汇总、依据溯源。该 skill 使用本地 JSONL/SQLite 索引，先检索证据再生成“结论 + 依据 + 引用 + 缺口”回答。
+  本地医院信息化标准知识库问答 skill。用于政策条款查询、等级要求、清单抽取、跨标准对比。仅允许使用本地 kb.sqlite/jsonl 证据，禁止联网与外部补全；遇到术语歧义先澄清，再回答。
 ---
 
 # Hospital KB QA
 
-## Overview
+## 固定入口
 
-该 skill 面向本项目知识库（`.docx + .jsonl`），提供两步流程：
-
-1. `ingest`：将文档标准化并构建本地索引。
-2. `query`：在多文档检索证据并输出可引用答案草稿。
-
-## Workflow
-
-### 1) 构建/更新知识库索引
-
-在项目根目录执行：
+必须优先调用：
 
 ```bash
-.venv/bin/python scripts/kb_ingest.py --kb-root ./kb --input-root . --include-docx --include-jsonl
+.venv/bin/python skills/hospital-kb-qa/scripts/kb_query.py \
+  --kb ./skills/hospital-kb-qa/kb/kb.sqlite \
+  --question "{{user_input}}" \
+  --top-k 12 \
+  --source-scope ./skills/hospital-kb-qa/references/source_scope.json \
+  --jsonl-root ./skills/hospital-kb-qa/kb/jsonl \
+  --json
 ```
 
-产物：
+禁止先自由 `jq/rg` 探索；必须先走 `kb_query.py`。
 
-- `kb/jsonl/*.jsonl`：标准化后的中间数据。
-- `kb/kb.sqlite`：检索索引库（`records`, `records_fts`, `ngrams`）。
+## 固定执行状态机（必须按顺序）
 
-### 2) 提问并检索证据
+1. 解析问题：识别 `query_type`、口径、等级、关键词、是否要求完整输出。
+2. 术语门控：若口径不唯一或等级依赖但不明确，返回 `clarification_required`，只问一个澄清问题并停止。
+3. 主检索：先按 `source_scope` 过滤 `source_file`，再用 sqlite 检索。
+4. 兜底补检：仅当 `status=no_evidence` 时，允许 `jq/rg` 在同一 source_scope 内补检一次。
+5. 受限生成：只基于 `evidence` 输出，不得扩展知识库外结论。
 
-```bash
-.venv/bin/python scripts/kb_query.py --kb ./kb/kb.sqlite --question "这里写用户问题" --top-k 12 --source-scope ./skills/hospital-kb-qa/references/source_scope.json --jsonl-root ./kb/jsonl --json
-```
+停止条件：
 
-## Fixed Execution State Machine (强制)
+1. 最多 `1 次主检索 + 1 次补检`。
+2. 仍无证据时直接 `no_evidence`，不得继续改写问题循环重试。
 
-所有模型必须按以下状态机执行，不得跳步，不得改写成自由探索流程。
+## 输出契约（必须遵守）
 
-### Layer 1: Retrieval（证据检索层）
+`kb_query.py --json` 输出字段：
 
-1. 先解析问题并结构化：
-   - `query_type`
-   - `scope`（标准口径）
-   - `level`（级别）
-   - `topic_keywords`
-   - `need_complete_output`（是否要求完整清单）
-2. 先做术语/口径澄清判定：
-   - 口径不唯一
-   - 等级不唯一且问题依赖等级
-   - 同时引用多个冲突标准名
-   命中任一条件：只输出一个澄清问题并停止。
-3. 检索顺序固定：
-   - 先按 `source_scope` 过滤 `source_file`
-   - 再执行 `sqlite` 检索（FTS/结构化）
-   - 仅当 `status=no_evidence` 才允许 `jq/rg` 补检
+1. `status`: `clarification_required | answered | no_evidence`
+2. `answerable`
+3. `evidence[]`: `source_file/table_index/row_index/content/score/retrieval_method`
+4. `draft_answer`
+5. `gaps[]`
+6. `clarification_question`
+7. `suggested_terms[]`
+8. `source_policy`（固定 `local_kb_only`）
+9. `fallback_used`
 
-### Layer 2: Structure Control（结构控制层）
-
-根据 `query_type` 决定输出结构：
-
-1. `fact`：结论 -> 依据 -> 引用 -> 缺口
-2. `list` / `filter_list`：完整条目列表 -> 引用 -> 缺口（不得摘要替代）
-3. `compare`：按口径 A/B 分别列依据 -> 对比结论 -> 引用 -> 缺口
-4. `locate`：定位结果（文档/章节/表/行）-> 原文片段 -> 引用
-5. `theme_summary`：主题归纳 -> 支撑证据 -> 引用 -> 缺口
-
-表格命中强制规则：
-
-1. 若命中证据包含 `table_index`（即命中表格行），必须按原表整表输出。
-2. 整表范围定义为同一 `source_file + table_index` 的全部行，按 `row_index` 原顺序输出。
-3. 禁止对表格内容做摘要、改写、合并重述或字段重命名。
-4. 可在表格后追加引用与缺口说明，但不得改动表格正文内容。
-
-### Layer 3: Constrained Generation（受限生成层）
-
-1. 只允许基于 `evidence` 生成回答，禁止知识库外补全。
-2. `list/filter_list` 必须完整展开，不得仅给概述。
-3. `answerable=false` 必须明确“证据不足，无法给出确定结论”。
-4. `status=no_evidence` 禁止给申报流程、实施路径等外延建议。
-5. 表格命中时优先输出“原表整表”，不得输出加工版表格。
-
-### Stop Conditions（停止条件）
-
-1. 每个问题最多：`1 次 sqlite 主检索 + 1 次 jq/rg 补检`。
-2. 若仍无证据：直接返回 `no_evidence`，禁止继续改写问题重试。
-3. 若需要澄清：只问 1 个澄清问题并停止等待用户确认。
-
-## Query Type Routing Rules (可执行约束)
-
-按以下优先级进行 `query_type` 路由（从上到下匹配，命中即停止）：
-
-1. `filter_list`：出现 `清单|完整|全部|逐条|明细|打分表|excel|xlsx|附件`
-2. `compare`：出现 `对比|比较|差异|区别|分别|哪个更`
-3. `locate`：出现 `哪一条|哪一行|哪个章节|附表|附件|条款位置|定位`
-4. `theme_summary`：出现 `汇总|归纳|总览|整体情况`
-5. 其他默认 `fact`
-
-补充规则：
-
-1. `filter_list` 必须走 Checklist Scope Map 对应来源与章节。
-2. 用户指定单一口径时，禁止跨口径召回。
-3. 用户明确要求 `excel/xlsx` 时，必须输出可下载附件（正文仅摘要）。
-4. 多口径问题先分口径检索，再合并渲染，禁止混合后再猜测归类。
-5. 任何 `table_index` 命中的答案，必须先完成整表回填再组织文字说明。
-
-返回字段：
-
-- `status`：`clarification_required | answered | no_evidence`。
-- `answerable`：是否达到可回答阈值。
-- `evidence[]`：证据片段，含 `source_file/table_index/row_index/content/score`。
-- `draft_answer`：按模板组织的回答草稿。
-- `gaps[]`：证据不足或不确定点。
-- `clarification_question`：需要澄清时的问题文本。
-- `suggested_terms`：候选标准术语列表。
-- `source_policy`：固定 `local_kb_only`。
-- `fallback_used`：是否触发 `jq/rg` 补检。
-- `evidence[].retrieval_method`：`sqlite_main | jq_rg_fallback`。
-
-## Answer Policy
-
-默认回答模板：
+回答结构：
 
 1. 结论
-2. 依据（跨文档）
-3. 引用（文档 + table_index + row_index）
+2. 依据
+3. 引用
 4. 不确定点/缺口
 
-输出风格约束（给其他 agent 的强约束）：
+## Query Type 路由（简版）
 
-- 回答必须直接命中用户问题，先给结论，禁止寒暄和铺垫。
-- 要满足“结论 + 依据 + 引用 + 缺口”结构前提下，避免重复与冗长解释。
+优先级从高到低：
+
+1. `filter_list`: `清单|完整|全部|逐条|明细|打分表|excel|xlsx|附件`
+2. `compare`: `对比|比较|差异|区别|分别|哪个更`
+3. `locate`: `哪一条|哪一行|哪个章节|附表|附件|条款位置|定位`
+4. `theme_summary`: `汇总|归纳|总览|整体情况`
+5. 默认 `fact`
 
 强约束：
 
-- 只允许使用本地 `kb.sqlite` 与本地文档，不得联网检索、不得引用外部常识补全。
-- 检索主通道必须是 `sqlite`；仅当 `status=no_evidence` 候选场景时才允许触发 `jq/rg` 补检。
-- `jq/rg` 补检必须继续受 `source_scope` 限制，禁止跨白名单来源兜底。
-- 仅基于 `evidence` 输出结论。
-- 术语不确定时必须先澄清，且每次只问一个澄清问题。
-- `answerable=false` 时必须明确“证据不足，无法给出确定结论”。
-- `status=no_evidence` 时禁止补充申报流程、实施路径等知识库外内容。
-- 不输出无证据支撑的推断。
+1. `filter_list` 必须完整展开，不允许摘要代替。
+2. 用户要求 `excel/xlsx/附件` 时，优先生成附件，正文仅摘要。
+3. 用户指定单一口径时，禁止跨口径召回。
 
-## Source Scope Filter (强制)
+## 表格命中规则（代码优先）
 
-查询顺序必须固定为：
+若证据命中 `table_index`，必须按原表输出：
 
-1. 先根据口径映射过滤 `source_file`
-2. 再执行 FTS / n-gram 检索与排序
+1. 回填同一 `source_file + table_index` 全部行。
+2. 按 `row_index` 原顺序输出。
+3. 禁止改写字段名、禁止摘要压缩。
 
-口径来源映射文件：
+## Checklist Scope Map（清单白名单）
 
-- `skills/hospital-kb-qa/references/source_scope.json`
+清单请求必须限定在以下来源：
 
-## Checklist Scope Map (章节索引白名单)
+1. 电子病历分级清单  
+来源：`国家卫健委_电子病历系统应用水平分级评价标准_试行_2018版`  
+章节：`附表3`
 
-清单请求时，必须优先在以下章节范围内抽取明细；禁止跨口径扩展到未指定章节。
+2. 信息互联互通清单  
+来源：`国家医疗健康信息医院信息互联互通标准化成熟度测评方案_2020年版`
 
-1. 电子病历分级标准清单  
-   来源：`国家卫健委_电子病历系统应用水平分级评价标准_试行_2018版`  
-   章节：`附表3`
+3. 智慧服务分级清单  
+来源：`医院智慧服务分级评估标准体系_试行_20190801`  
+章节：`附件3`
 
-2. 信息系统互联互通分级标准清单  
-   来源：`国家医疗健康信息医院信息互联互通标准化成熟度测评方案_2020年版`  
-   章节：`分级标准清单相关表格（按用户等级要求筛选）`
+4. 智慧管理分级清单  
+来源：`医院智慧管理分级评估具体要求`
 
-3. 智慧服务分级标准清单  
-   来源：`医院智慧服务分级评估标准体系_试行_20190801`  
-   章节：`附件3`
+若白名单范围内未命中：明确说明“指定范围未检索到明细”，不得跨来源补齐。
 
-4. 智慧管理分级标准清单  
-   来源：`医院智慧管理分级评估具体要求`  
-   章节：`分级标准清单相关章节（按用户等级要求筛选）`
+## 脚本优先原则（避免模型漂移）
 
-执行要求：
+以下逻辑必须由脚本处理，不靠 LLM 自由发挥：
 
-- 若用户指定口径，只在对应白名单来源与章节抽取。
-- 若用户同时指定多个口径，分别抽取后合并输出。
-- 若白名单范围未命中，必须明确“指定范围未检索到明细”，不得改去其它来源补齐。
+1. 术语归一与澄清门控
+2. source_scope 过滤
+3. query_type 路由
+4. 表格整表回填
+5. no_evidence 判定
+6. JSON 输出结构校验
 
-## Notes
+## 4 个标准示例（必须对齐）
 
-- 首版接入范围：`docx + jsonl`（`.doc` 暂不自动转换）。
-- 如果源文档更新，先重新执行 `ingest` 再 `query`。
-- 术语词表文件：`skills/hospital-kb-qa/references/term_lexicon.json`。
-- 口径来源白名单：`skills/hospital-kb-qa/references/source_scope.json`。
-- 依赖项目级虚拟环境 `.venv`。
+### 示例 1：术语错位先澄清
+
+用户问题：
+`信息互联二级需要什么要求`
+
+期望：
+
+1. `status=clarification_required`
+2. `clarification_question=你是不是指“互联互通二级”？`
+3. 不输出业务结论
+
+### 示例 2：单口径等级问答
+
+用户问题：
+`智慧服务 诊前服务，急救衔接，二级有什么要求`
+
+期望：
+
+1. `status=answered`
+2. `evidence` 只来自智慧服务标准 `source_file`
+3. 给出可追溯引用（文档 + table_index + row_index）
+
+### 示例 3：完整清单请求
+
+用户问题：
+`智慧服务2级，需要完整清单，excel`
+
+期望：
+
+1. 识别为 `filter_list`
+2. 走清单白名单来源
+3. 输出完整条目并生成附件（xlsx）
+
+### 示例 4：无证据禁止发散
+
+用户问题：
+`电子病历3级申报流程`
+
+期望（当库中无流程条款）：
+
+1. `status=no_evidence`
+2. 明确证据不足
+3. 不输出外部申报流程建议
+
+## 依赖与路径
+
+1. 只使用项目级 `.venv`
+2. `source_scope`: `skills/hospital-kb-qa/references/source_scope.json`
+3. `term_lexicon`: `skills/hospital-kb-qa/references/term_lexicon.json`
+4. kb 数据根目录：`skills/hospital-kb-qa/kb`
